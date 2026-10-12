@@ -3,11 +3,19 @@ import re
 from functools import partial
 from glob import has_magic
 from pathlib import Path, PurePath
-from typing import Callable, Optional, Union
+from typing import Callable, Iterable, Optional, Union
 
 import huggingface_hub
 from fsspec.core import url_to_fs
 from huggingface_hub import HfFileSystem
+
+
+try:
+    # `glob_translate` is what `fsspec` uses to translate glob patterns to regex patterns.
+    # It may be missing from old `fsspec` versions, in which case patterns are resolved with `fs.glob`.
+    from fsspec.utils import glob_translate as _glob_translate
+except ImportError:
+    _glob_translate = None
 from packaging import version
 from tqdm.contrib.concurrent import thread_map
 
@@ -186,12 +194,12 @@ def _is_inside_unrequested_special_dir(matched_rel_path: str, pattern: str) -> b
     >>> _is_inside_unrequested_special_dir("__pycache__/b.txt", "__*/*")
     False
     """
-    # We just need to check if every special directories from the path is present explicitly in the pattern.
+    # We just need to check if every special directory from the path is present explicitly in the pattern.
     # Since we assume that the path matches the pattern, it's equivalent to counting that both
     # the parent path and the parent pattern have the same number of special directories.
-    data_dirs_to_ignore_in_path = [part for part in PurePath(matched_rel_path).parent.parts if part.startswith("__")]
-    data_dirs_to_ignore_in_pattern = [part for part in PurePath(pattern).parent.parts if part.startswith("__")]
-    return len(data_dirs_to_ignore_in_path) != len(data_dirs_to_ignore_in_pattern)
+    data_dirs_to_ignore_in_path = _num_special_dirs(PurePath(matched_rel_path).parent.parts)
+    data_dirs_to_ignore_in_pattern = _num_special_dirs(PurePath(pattern).parent.parts)
+    return data_dirs_to_ignore_in_path != data_dirs_to_ignore_in_pattern
 
 
 def _is_unrequested_hidden_file_or_is_inside_unrequested_hidden_dir(matched_rel_path: str, pattern: str) -> bool:
@@ -247,13 +255,29 @@ def _is_unrequested_hidden_file_or_is_inside_unrequested_hidden_dir(matched_rel_
     # We just need to check if every hidden part from the path is present explicitly in the pattern.
     # Since we assume that the path matches the pattern, it's equivalent to counting that both
     # the path and the pattern have the same number of hidden parts.
-    hidden_directories_in_path = [
-        part for part in PurePath(matched_rel_path).parts if part.startswith(".") and not set(part) == {"."}
-    ]
-    hidden_directories_in_pattern = [
-        part for part in PurePath(pattern).parts if part.startswith(".") and not set(part) == {"."}
-    ]
-    return len(hidden_directories_in_path) != len(hidden_directories_in_pattern)
+    hidden_directories_in_path = _num_hidden_parts(PurePath(matched_rel_path).parts)
+    hidden_directories_in_pattern = _num_hidden_parts(PurePath(pattern).parts)
+    return hidden_directories_in_path != hidden_directories_in_pattern
+
+
+def _num_special_dirs(parts: Iterable[str]) -> int:
+    """Number of special directories in `parts`, i.e. of directories whose name starts with "__" like "__pycache__"."""
+    return sum(1 for part in parts if part.startswith("__"))
+
+
+def _num_hidden_parts(parts: Iterable[str]) -> int:
+    """Number of hidden parts in `parts`, i.e. of parts that start with "." and that are not made only of dots."""
+    return sum(1 for part in parts if part.startswith(".") and not set(part) == {"."})
+
+
+def _path_parts(path: str) -> list[str]:
+    """
+    Same as `PurePath(path).parts` for the posix-like paths fsspec works with, but much faster.
+
+    It is used instead of `PurePath` since it is called once per resolved file, and a repository can contain
+    hundreds of thousands of files.
+    """
+    return [part for part in path.split("/") if part not in ("", ".")]
 
 
 def _get_data_files_patterns(pattern_resolver: Callable[[str], list[str]]) -> dict[str, list[str]]:
@@ -298,6 +322,121 @@ def _get_data_files_patterns(pattern_resolver: Callable[[str], list[str]]) -> di
         if non_empty_splits:
             return {split: patterns_dict[split] for split in non_empty_splits}
     raise FileNotFoundError(f"Couldn't resolve pattern {pattern} with resolver {pattern_resolver}")
+
+
+# Protocols for which the listing of the root of a pattern is reused when resolving several patterns one after the
+# other (see `_glob_matches`). Only `hf://` is enabled by default since `HfFileSystem` already caches the listings it
+# does, so that the behavior of the other remote filesystems (that list the data again at every call) doesn't change.
+_REUSE_LISTING_PROTOCOLS = ("hf",)
+
+# Attribute of a filesystem object used to store its last listing (see `_find_with_cached_listing`).
+_LISTING_CACHE_ATTR = "_datasets_last_listing"
+
+# Wildcard tokens of a glob pattern: "*" (and "**"), "?" and "[...]" character classes.
+_WILDCARD_TOKENS_RE = re.compile(r"\*+|\?|\[[^\]]*\]")
+
+
+def _required_literals(pattern: str) -> tuple[str, ...]:
+    """
+    The literal parts of the glob `pattern` that any matching path must contain, e.g. ("train",) for "**/*train*".
+
+    They are used to skip the paths of a listing that cannot match the pattern before matching them against its
+    regex (see `_glob_matches`), since matching a regex with "**" in it is orders of magnitude slower than
+    checking that a string contains a literal.
+
+    The "/" at the edges of a literal are dropped since a "**" in the pattern can match them: "**/*train*" matches
+    both "train.txt" and "data/train.txt", so only "train" is required in the path.
+    """
+    return tuple(token for token in (part.strip("/") for part in _WILDCARD_TOKENS_RE.split(pattern)) if token)
+
+
+def _filter_by_literals(listing: list[tuple[str, dict]], literals: tuple[str, ...]) -> list[tuple[str, dict]]:
+    """Keep the `(path, info)` pairs of `listing` whose path contains every one of `literals`."""
+    for literal in literals:
+        listing = [item for item in listing if literal in item[0]]
+    return listing
+
+
+def _find_with_cached_listing(
+    fs, root: str, maxdepth: Optional[int], withdirs: bool, **kwargs
+) -> list[tuple[str, dict]]:
+    """
+    Same as `sorted(fs.find(root, maxdepth=maxdepth, withdirs=withdirs, detail=True, **kwargs).items())`, but the
+    result is reused by the next call with the same arguments on the same filesystem object.
+
+    Listing a large remote repository takes tens of seconds (the Hugging Face Hub serves 1000 entries per HTTP
+    request, and a repository can contain hundreds of thousands of files). Since resolving the data files of a
+    repository lists the same root again for every pattern (see `_glob_matches` and `_get_data_files_patterns`),
+    the listing of the last root is kept on the filesystem object to be reused.
+
+    Only one listing is kept at a time, so that the memory it uses doesn't grow with the number of resolved roots.
+    Like the cache of `HfFileSystem`, this makes the result of a listing independent from the changes made to the
+    repository since the previous listing with the same arguments.
+    """
+    key = (root, maxdepth, withdirs, tuple(sorted(kwargs.items())))
+    cached_listing = getattr(fs, _LISTING_CACHE_ATTR, None)
+    if cached_listing is not None and cached_listing[0] == key:
+        return cached_listing[1]
+    listing = sorted(fs.find(root, maxdepth=maxdepth, withdirs=withdirs, detail=True, **kwargs).items())
+    setattr(fs, _LISTING_CACHE_ATTR, (key, listing))
+    return listing
+
+
+def _glob_matches(fs, path: str, **kwargs) -> list[tuple[str, dict]]:
+    """
+    Same as `fs.glob(path, detail=True, **kwargs).items()`, but reusing the listing of the root of `path` between
+    calls (see `_find_with_cached_listing`).
+
+    The algorithm is the one of `fsspec.spec.AbstractFileSystem.glob`: the root of the pattern is listed, then every
+    path of the listing is matched against the regex of the pattern. The two differences are that:
+
+    - the listing is done by `_find_with_cached_listing`, so that resolving several patterns that share the same
+      root lists it only once
+    - the paths that don't contain a literal of the pattern are skipped before being matched against its regex, for
+      the same result at a fraction of the cost (see `_required_literals`)
+
+    It is used to resolve the data files patterns of a remote repository (see `resolve_pattern`): auto-inferring the
+    patterns of a dataset resolves dozens of patterns that all share the same root, and listing a large repository
+    again for each of them takes tens of seconds.
+
+    Returns:
+        The sorted list of `(path, info)` pairs that match `path`, like `fs.glob(path, detail=True).items()`.
+    """
+    if _glob_translate is None:
+        # `glob_translate` is not available in this version of `fsspec`: stick to `fs.glob`
+        return list(fs.glob(path, detail=True, **kwargs).items())
+    if isinstance(fs, HfFileSystem):
+        # Same as `HfFileSystem.glob`: the path is resolved before being listed, so that e.g. a repository that
+        # doesn't exist raises an error mentioning the whole pattern, like `fs.glob` does.
+        path = fs.resolve_path(path, revision=kwargs.get("revision")).unresolve()
+    seps = (os.path.sep, os.path.altsep) if os.path.altsep else (os.path.sep,)
+    ends_with_sep = path.endswith(seps)
+    path = fs._strip_protocol(path)
+    append_slash_to_dirname = ends_with_sep or path.endswith(tuple(sep + "**" for sep in seps))
+    first_magic_idx = min(path.find(char) if char in path else len(path) for char in ("*", "?", "["))
+    if not has_magic(path):
+        return [(path, fs.info(path, **kwargs))] if fs.exists(path, **kwargs) else []
+    # Split off the part of the pattern that is a root directory, and count the depth of the remaining part: only
+    # the files up to that depth have to be listed (like `fs.glob` does).
+    if "/" in path[:first_magic_idx]:
+        first_magic_idx = path[:first_magic_idx].rindex("/")
+        root = path[: first_magic_idx + 1]
+    else:
+        root = ""
+    depth = path[first_magic_idx + 1 :].count("/") + 1
+    if "**" in path:
+        depth = None
+    pattern = re.compile(_glob_translate(path + ("/" if ends_with_sep else "")))
+    listing = _filter_by_literals(
+        _find_with_cached_listing(fs, root, maxdepth=depth, withdirs=True, **kwargs), _required_literals(path)
+    )
+    return [
+        (matched_path, info)
+        for matched_path, info in listing
+        if pattern.match(
+            matched_path + "/" if append_slash_to_dirname and info["type"] == "directory" else matched_path
+        )
+    ]
 
 
 def resolve_pattern(
@@ -371,14 +510,27 @@ def resolve_pattern(
     # if the pattern contains hops like "zip://csv/*.csv::data.zip", we need to keep them after globbing
     _, *rest_hops = pattern.split("::")
     matched_paths = []
-    for filepath, info in fs.glob(fs_pattern, detail=True, **glob_kwargs).items():
+    if protocol in _REUSE_LISTING_PROTOCOLS and _glob_translate is not None and not rest_hops:
+        # Reuse the listing of the root of the pattern: the patterns of a same resolution share the same root, and
+        # listing a large remote repository again for each pattern takes minutes (see `_glob_matches`).
+        matches = _glob_matches(fs, fs_pattern, **glob_kwargs)
+    else:
+        matches = list(fs.glob(fs_pattern, detail=True, **glob_kwargs).items())
+    # The two checks below ignore the files in a special or hidden directory that the pattern doesn't request
+    # explicitly: they do the same as `_is_inside_unrequested_special_dir` and
+    # `_is_unrequested_hidden_file_or_is_inside_unrequested_hidden_dir`, but with the parts of the pattern computed
+    # once for all the matched files, and without `PurePath` (see `_path_parts`).
+    num_special_dirs_in_pattern = _num_special_dirs(_path_parts(fs_pattern)[:-1])
+    num_hidden_parts_in_pattern = _num_hidden_parts(_path_parts(fs_pattern))
+    for filepath, info in matches:
         if not (info["type"] == "file" or (info.get("islink") and os.path.isfile(os.path.realpath(filepath)))) or (
             xbasename(filepath) in files_to_ignore
         ):
             continue
-        if _is_inside_unrequested_special_dir(filepath, fs_pattern):
+        path_parts = _path_parts(filepath)
+        if _num_special_dirs(path_parts[:-1]) != num_special_dirs_in_pattern:
             continue
-        if _is_unrequested_hidden_file_or_is_inside_unrequested_hidden_dir(filepath, fs_pattern):
+        if _num_hidden_parts(path_parts) != num_hidden_parts_in_pattern:
             continue
         filepath = filepath if "://" in filepath else protocol_prefix + filepath
         if rest_hops:

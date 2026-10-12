@@ -1,22 +1,31 @@
 import copy
 import os
-from pathlib import Path
+import random
+from pathlib import Path, PurePath
 from typing import List
 from unittest.mock import patch
 
 import fsspec
 import pytest
+from fsspec.core import url_to_fs
 from fsspec.registry import _registry as _fsspec_registry
 from fsspec.spec import AbstractFileSystem
 
+from datasets import data_files
 from datasets.data_files import (
+    _LISTING_CACHE_ATTR,
     DataFilesDict,
     DataFilesList,
     DataFilesPatternsDict,
     DataFilesPatternsList,
     _get_data_files_patterns,
+    _glob_matches,
     _is_inside_unrequested_special_dir,
     _is_unrequested_hidden_file_or_is_inside_unrequested_hidden_dir,
+    _num_hidden_parts,
+    _num_special_dirs,
+    _path_parts,
+    _required_literals,
     get_data_patterns,
     resolve_pattern,
 )
@@ -360,6 +369,252 @@ def test_resolve_pattern_in_dataset_repository_special_base_path(tmpfs):
     tmpfs.touch("__special__/a.txt")
     resolved_data_files = resolve_pattern("*", base_path="tmp://__special__")
     assert len(resolved_data_files) == 1
+
+
+def test_path_parts_has_the_same_hidden_and_special_parts_as_purepath():
+    # `_path_parts` is used instead of `PurePath(...).parts` since it is called for every resolved file.
+    for path in [
+        "a/b.txt",
+        "/a/b.txt",
+        "a//b.txt",
+        "./a/b.txt",
+        "a/./b.txt",
+        "a/b/",
+        ".",
+        "..",
+        "a/..",
+        ".hidden/a.txt",
+        ".hidden/",
+        "__pycache__/script.py",
+        "__pycache__/",
+        "a/__pycache__/b/c.txt",
+        ".../weird.txt",
+    ]:
+        assert _num_hidden_parts(_path_parts(path)) == _num_hidden_parts(PurePath(path).parts), path
+        assert _num_special_dirs(_path_parts(path)[:-1]) == _num_special_dirs(PurePath(path).parent.parts), path
+
+
+@pytest.mark.parametrize(
+    "pattern,literals",
+    [
+        ("**/*train*", ("train",)),
+        ("**/*[-._ 0-9]train[-._ 0-9]*", ("train",)),
+        ("**", ()),
+        ("*", ()),
+        ("*.txt", (".txt",)),
+        ("data/*.csv", ("data", ".csv")),
+        ("data/?.txt", ("data", ".txt")),
+        ("data/[st]*.txt", ("data", ".txt")),
+        ("**/.*", (".",)),
+        ("__pycache__/**", ("__pycache__",)),
+        ("data/", ("data",)),
+        ("train.txt", ("train.txt",)),
+        ("datasets/x/**/*.parquet", ("datasets/x", ".parquet")),
+    ],
+)
+def test_required_literals(pattern, literals):
+    # Any path that matches `pattern` must contain all of its literals.
+    assert _required_literals(pattern) == literals
+
+
+_GLOB_TEST_PATTERNS = [
+    "*",
+    "**",
+    "**/*",
+    "*.txt",
+    "**/*.txt",
+    "**/train.txt",
+    "**/train*",
+    "**/*.zip",
+    "**/*.parquet",
+    "**/.*",
+    ".*",
+    ".*/*",
+    ".hidden_file.txt",
+    "data/*",
+    "data/**",
+    "data/**/*",
+    "data/*train*",
+    "data/?.txt",
+    "data/[st]*.txt",
+    "data/",
+    "data/subdir/**",
+    "data/.hidden_dir/*",
+    "__pycache__/*",
+    "**/__pycache__/**",
+    "**/",
+    "train.txt",
+    "data/train.txt",
+    "missing*",
+    "data/missing/*",
+]
+
+_LARGE_REPO_FILES = [
+    "data/train.txt",
+    "data/test.txt",
+    "data/other.csv",
+    "data/train-00000-of-00001.parquet",
+    "data/subdir/train.txt",
+    "data/subdir/deep/file.json",
+    "data/subdir/.hidden.txt",
+    "data/.hidden_dir/file.txt",
+    "data/__special__/y.txt",
+    ".hidden_file.txt",
+    ".hidden_dir/a.txt",
+    "__pycache__/script.py",
+    "train.txt",
+    "test.zip",
+    "README.md",
+    "a-b/train-00000-of-00001.parquet",
+]
+
+
+@pytest.fixture
+def large_mock_repo_fs():
+    """Mock remote filesystem with sub-directories, hidden files and special directories."""
+    DummyTestFS = mock_fs(_LARGE_REPO_FILES)
+    _fsspec_registry["mock"] = DummyTestFS
+    yield DummyTestFS
+    del _fsspec_registry["mock"]
+
+
+def _resolved_data_files_or_error(pattern, **kwargs):
+    """Resolve `pattern` and return the error message instead of raising when it matches no data file."""
+    try:
+        return resolve_pattern(pattern, **kwargs)
+    except FileNotFoundError as error:
+        return f"FileNotFoundError: {error}"
+
+
+@pytest.mark.parametrize("pattern", _GLOB_TEST_PATTERNS)
+def test_glob_matches_returns_same_paths_as_fs_glob(large_mock_repo_fs, pattern):
+    fs = large_mock_repo_fs()
+    expected = fs.glob(pattern, detail=True)
+    matches = _glob_matches(fs, pattern)
+    assert dict(matches) == expected
+    assert [path for path, _ in matches] == list(expected), "the matched paths must be sorted like fs.glob does"
+
+
+@pytest.mark.parametrize("pattern", _GLOB_TEST_PATTERNS)
+def test_glob_matches_returns_same_paths_as_fs_glob_after_reusing_the_listing(large_mock_repo_fs, pattern):
+    # the listing of a root is cached on the filesystem object: resolving a pattern with a cached listing of its
+    # root must give the same result as listing it again
+    fs = large_mock_repo_fs()
+    _glob_matches(fs, "data/**")
+    assert dict(_glob_matches(fs, pattern)) == fs.glob(pattern, detail=True)
+
+
+def test_glob_matches_lists_the_shared_root_only_once(large_mock_repo_fs):
+    fs = large_mock_repo_fs()
+    patterns = ["**/*.txt", "**/train*", "**"]
+    expected = {pattern: fs.glob(pattern, detail=True) for pattern in patterns}
+    find_calls = []
+    original_find = fs.find
+
+    def counting_find(*args, **kwargs):
+        find_calls.append((args, kwargs))
+        return original_find(*args, **kwargs)
+
+    fs.find = counting_find
+    for pattern in patterns:
+        assert dict(_glob_matches(fs, pattern)) == expected[pattern]
+    assert len(find_calls) == 1, "the three patterns share the same root, so it must be listed only once"
+
+
+def test_glob_matches_keeps_only_the_last_listing(large_mock_repo_fs):
+    fs = large_mock_repo_fs()
+    _glob_matches(fs, "**/*.txt")
+    _glob_matches(fs, "data/*.txt")
+    # only one listing is kept at a time, so that the memory it uses doesn't grow with the number of listings
+    assert getattr(fs, _LISTING_CACHE_ATTR)[0][0] == "data/"
+
+
+@pytest.mark.parametrize("pattern", ["**", "data/**/*.txt", "**/train*", "train.txt"])
+def test_glob_matches_without_glob_translate_falls_back_to_fs_glob(large_mock_repo_fs, monkeypatch, pattern):
+    # `glob_translate` may be missing from old versions of `fsspec`, in which case `fs.glob` is used
+    monkeypatch.setattr(data_files, "_glob_translate", None)
+    fs = large_mock_repo_fs()
+    assert dict(_glob_matches(fs, pattern)) == fs.glob(pattern, detail=True)
+
+
+def test_resolve_pattern_without_glob_translate(large_mock_repo_fs, monkeypatch):
+    expected = resolve_pattern("data/**/*.txt", base_path="mock://")
+    monkeypatch.setattr(data_files, "_glob_translate", None)
+    assert resolve_pattern("data/**/*.txt", base_path="mock://") == expected
+
+
+_RANDOM_FILE_PARTS = ["a", "b", "data", "sub", "train", "test", ".hidden", "__pycache__", "x", "file.txt", "f.log"]
+_RANDOM_PATTERN_TOKENS = [
+    "*",
+    "**",
+    "a",
+    "b",
+    "data",
+    "sub",
+    "*.txt",
+    "[ab]",
+    "?.log",
+    "train",
+    "test",
+    ".hidden",
+    "__pycache__",
+    "x[0-9]y",
+    "*.parquet",
+    "*[0-9]",
+    "x",
+    "file.txt",
+]
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_glob_matches_fsspec_glob_on_random_trees_and_patterns(seed):
+    # `_glob_matches` must resolve patterns exactly like `fs.glob` does: check it on random trees and patterns.
+    rng = random.Random(seed)
+    files = sorted(
+        {"/".join(rng.choice(_RANDOM_FILE_PARTS) for _ in range(rng.randint(0, 3))) for _ in range(rng.randint(1, 12))}
+    )
+    DummyTestFS = mock_fs(files)
+    fs = DummyTestFS()
+    for _ in range(50):
+        pattern = "/".join(rng.choice(_RANDOM_PATTERN_TOKENS) for _ in range(rng.randint(0, 3)))
+        try:
+            expected = fs.glob(pattern, detail=True)
+        except Exception as error:
+            # `fs.glob` itself can fail on a mock filesystem, e.g. when the root of the pattern is a file
+            with pytest.raises(type(error)):
+                _glob_matches(DummyTestFS(), pattern)
+            continue
+        assert dict(_glob_matches(DummyTestFS(), pattern)) == expected, (files, pattern)
+
+
+@pytest.mark.parametrize("pattern", _GLOB_TEST_PATTERNS)
+def test_resolve_pattern_with_reused_listing_returns_the_same_files(large_mock_repo_fs, monkeypatch, pattern):
+    # "mock" is added to `_REUSE_LISTING_PROTOCOLS` to make the mock filesystem use the same code path as the
+    # "hf://" repositories, whose listings are reused between patterns
+    expected = _resolved_data_files_or_error(pattern, base_path="mock://")
+    monkeypatch.setattr(data_files, "_REUSE_LISTING_PROTOCOLS", data_files._REUSE_LISTING_PROTOCOLS + ("mock",))
+    assert _resolved_data_files_or_error(pattern, base_path="mock://") == expected
+
+
+@pytest.mark.parametrize("pattern", ["**", "**/*.txt", "data/**", "**/train*"])
+def test_resolve_pattern_with_reused_listing_returns_the_same_files_with_extensions(
+    large_mock_repo_fs, monkeypatch, pattern
+):
+    expected = _resolved_data_files_or_error(pattern, base_path="mock://", allowed_extensions=[".txt"])
+    monkeypatch.setattr(data_files, "_REUSE_LISTING_PROTOCOLS", data_files._REUSE_LISTING_PROTOCOLS + ("mock",))
+    assert _resolved_data_files_or_error(pattern, base_path="mock://", allowed_extensions=[".txt"]) == expected
+
+
+def test_resolve_pattern_locally_does_not_cache_the_listing(complex_data_dir):
+    resolve_pattern("**", base_path=complex_data_dir)
+    fs, _ = url_to_fs(complex_data_dir)
+    assert getattr(fs, _LISTING_CACHE_ATTR, None) is None
+
+
+def test_resolve_pattern_in_dataset_repository_does_not_cache_the_listing(hub_dataset_repo_path):
+    resolve_pattern("**", base_path=hub_dataset_repo_path)
+    fs, _ = url_to_fs(hub_dataset_repo_path)
+    assert getattr(fs, _LISTING_CACHE_ATTR, None) is None
 
 
 @pytest.fixture

@@ -497,22 +497,54 @@ def get_data_patterns(base_path: str, download_config: Optional[DownloadConfig] 
         raise EmptyDatasetError(f"The directory at {base_path} doesn't contain any data files") from None
 
 
+def _data_file_repo_root(data_file: str, path_in_repo: str) -> Optional[str]:
+    """
+    The part of `data_file` that comes before `path_in_repo`, e.g. "hf://datasets/user/repo@main/" for
+    "hf://datasets/user/repo@main/data/train.txt". Every data file below this root belongs to the same repository
+    and revision, since a hf:// URL always starts with "<repo type>/<repo id>[@<revision>]/".
+
+    It is None if `data_file` isn't a file inside a directory of the repository, e.g. "hf://datasets/user/repo@main"
+    for "README.md". The root must end with "/", otherwise it could also be the prefix of another repo id, like
+    "hf://datasets/user/repo" for "hf://datasets/user/repo2/data/train.txt".
+    """
+    if not path_in_repo or not data_file.endswith(path_in_repo):
+        return None
+    root = data_file[: len(data_file) - len(path_in_repo)]
+    return root if root.endswith("/") else None
+
+
 def _get_single_origin_metadata(
     data_file: str,
     download_config: Optional[DownloadConfig] = None,
+    cache: Optional[dict[str, SingleOriginMetadata]] = None,
 ) -> SingleOriginMetadata:
+    # The origin metadata of a data file of a repository is (repo_id, revision): it is the same for every data
+    # file below the root of the repository, so it is computed on the first data file only and kept in `cache`
+    # (`{root: origin_metadata}`) to be reused by the other files of the same repository. It matters since a
+    # repository can contain hundreds of thousands of data files, and resolving one takes tens of microseconds.
+    if cache:
+        for root, origin_metadata in cache.items():
+            if data_file.startswith(root):
+                return origin_metadata
     if data_file.startswith(config.HF_ENDPOINT):
         fs = HfFileSystem(endpoint=config.HF_ENDPOINT, token=download_config.token)
-        data_file = "hf://" + data_file[len(config.HF_ENDPOINT) + 1 :]
-        data_file = data_file.replace("/resolve/", "/" if data_file.startswith("hf://buckets/") else "@", 1)
-        fs_path = data_file
+        hf_url = "hf://" + data_file[len(config.HF_ENDPOINT) + 1 :]
+        hf_url = hf_url.replace("/resolve/", "/" if hf_url.startswith("hf://buckets/") else "@", 1)
+        fs_path = hf_url
     else:
-        data_file, storage_options = _prepare_path_and_storage_options(data_file, download_config=download_config)
-        fs, fs_path = url_to_fs(data_file, **storage_options)
+        prepared_data_file, storage_options = _prepare_path_and_storage_options(
+            data_file, download_config=download_config
+        )
+        fs, fs_path = url_to_fs(prepared_data_file, **storage_options)
     if isinstance(fs, HfFileSystem):
         resolved_path = fs.resolve_path(fs_path)
         if hasattr(resolved_path, "revision"):  # no revision for buckets
-            return resolved_path.repo_id, resolved_path.revision
+            origin_metadata = (resolved_path.repo_id, resolved_path.revision)
+            if cache is not None:
+                root = _data_file_repo_root(data_file, resolved_path.path_in_repo)
+                if root is not None:
+                    cache[root] = origin_metadata
+            return origin_metadata
     info = fs.info(fs_path)
     # s3fs uses "ETag", gcsfs uses "etag", and for local we simply check mtime
     for key in ["ETag", "etag", "mtime"]:
@@ -528,10 +560,11 @@ def _get_origin_metadata(
 ) -> list[SingleOriginMetadata]:
     max_workers = max_workers if max_workers is not None else config.HF_DATASETS_MULTITHREADING_MAX_WORKERS
     if all("hf://" in data_file for data_file in data_files):
-        # No need for multithreading here since the origin metadata of HF files
-        # is (repo_id, revision) and is cached after first .info() call.
+        # No need for multithreading here since the origin metadata of HF files is (repo_id, revision), and since
+        # it is computed once per repository root rather than once per data file (see `cache` below).
+        cache: dict[str, SingleOriginMetadata] = {}
         return [
-            _get_single_origin_metadata(data_file, download_config=download_config)
+            _get_single_origin_metadata(data_file, download_config=download_config, cache=cache)
             for data_file in hf_tqdm(
                 data_files,
                 desc="Resolving data files",

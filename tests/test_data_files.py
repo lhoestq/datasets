@@ -1,6 +1,7 @@
 import copy
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import patch
 
@@ -8,18 +9,22 @@ import fsspec
 import pytest
 from fsspec.registry import _registry as _fsspec_registry
 from fsspec.spec import AbstractFileSystem
+from huggingface_hub import HfFileSystem
 
 from datasets.data_files import (
     DataFilesDict,
     DataFilesList,
     DataFilesPatternsDict,
     DataFilesPatternsList,
+    _data_file_repo_root,
     _get_data_files_patterns,
+    _get_origin_metadata,
     _is_inside_unrequested_special_dir,
     _is_unrequested_hidden_file_or_is_inside_unrequested_hidden_dir,
     get_data_patterns,
     resolve_pattern,
 )
+from datasets.download.download_config import DownloadConfig
 from datasets.fingerprint import Hasher
 
 
@@ -690,3 +695,113 @@ def test_get_data_patterns_from_directory_with_the_word_data_twice(tmp_path):
     data_file.touch()
     data_file_patterns = get_data_patterns(repo_dir.as_posix())
     assert data_file_patterns == {"train": ["data/train-[0-9][0-9][0-9][0-9][0-9]-of-[0-9][0-9][0-9][0-9][0-9]*.*"]}
+
+
+@pytest.mark.parametrize(
+    "data_file, path_in_repo, expected_root",
+    [
+        ("hf://datasets/user/repo/data/train.txt", "data/train.txt", "hf://datasets/user/repo/"),
+        ("hf://datasets/user/repo@main/data/train.txt", "data/train.txt", "hf://datasets/user/repo@main/"),
+        ("hf://datasets/user/repo@refs/pr/1/train.txt", "train.txt", "hf://datasets/user/repo@refs/pr/1/"),
+        (
+            "https://huggingface.co/datasets/user/repo/resolve/main/data/train.txt",
+            "data/train.txt",
+            "https://huggingface.co/datasets/user/repo/resolve/main/",
+        ),
+        # query arguments are part of the path in the repo, so the root is still the root of the repo
+        (
+            "hf://datasets/user/repo/data/train.txt?repo_type=dataset",
+            "data/train.txt?repo_type=dataset",
+            "hf://datasets/user/repo/",
+        ),
+        # the file is at the root of the repo: there is no directory to share with other files
+        ("hf://datasets/user/repo@main", "train.txt", None),
+        # the root must end with "/", otherwise it could be the prefix of another repo id or revision
+        ("hf://datasets/user/repo@main/data/train.txt", "/data/train.txt", None),
+        # the path in the repo isn't part of the URL
+        ("hf://datasets/user/repo/data/train.txt", "other/train.txt", None),
+        ("hf://datasets/user/repo/data/train.txt", "", None),
+    ],
+)
+def test_data_file_repo_root(data_file, path_in_repo, expected_root):
+    assert _data_file_repo_root(data_file, path_in_repo) == expected_root
+
+
+@pytest.fixture
+def fake_resolve_path(monkeypatch):
+    """Replace `HfFileSystem.resolve_path` with an offline version, and return the list of paths it was called with."""
+
+    calls = []
+
+    def fake_resolve_path(self, path, revision=None):
+        calls.append(path)
+        # "datasets/user/repo@revision/path/in/repo" has repo_id="user/repo", revision="revision" and path_in_repo="path/in/repo"
+        _, namespace, repo_name, *path_parts = path.removeprefix("hf://").split("/")
+        repo_id, _, resolved_revision = f"{namespace}/{repo_name}".partition("@")
+        return SimpleNamespace(
+            repo_id=repo_id, revision=resolved_revision or "main", path_in_repo="/".join(path_parts)
+        )
+
+    monkeypatch.setattr(HfFileSystem, "resolve_path", fake_resolve_path)
+    return calls
+
+
+def test_get_origin_metadata_resolves_each_repo_root_once(fake_resolve_path):
+    data_files = [f"hf://datasets/user/repo/data/shard-{i}.txt" for i in range(3)] + [
+        "hf://datasets/other/repo/data/train.txt"
+    ]
+    origin_metadata = _get_origin_metadata(data_files)
+    assert origin_metadata == [
+        ("user/repo", "main"),
+        ("user/repo", "main"),
+        ("user/repo", "main"),
+        ("other/repo", "main"),
+    ]
+    # the metadata is resolved once per repo root only ("user/repo" and "other/repo" here)
+    assert fake_resolve_path == ["datasets/user/repo/data/shard-0.txt", "datasets/other/repo/data/train.txt"]
+
+
+def test_get_origin_metadata_of_data_files_with_different_repo_roots(fake_resolve_path):
+    data_files = [
+        "hf://datasets/user/repo/data/train.txt",
+        "hf://datasets/user/repo/data/train.txt?repo_type=dataset",  # the query is part of the path in the repo
+        "hf://datasets/user/repo2/data/train.txt",  # same prefix but different repo
+        "hf://datasets/user/repo@main/data/train.txt",  # same repo with the revision spelled out
+        "hf://datasets/user/repo@a1b2c3d/data/train.txt",  # same repo at another revision
+        "hf://datasets/user/repo/data/nested/deeper/train.txt",  # same repo, deeper path
+    ]
+    origin_metadata = _get_origin_metadata(data_files)
+    assert origin_metadata == [
+        ("user/repo", "main"),
+        ("user/repo", "main"),
+        ("user/repo2", "main"),
+        ("user/repo", "main"),
+        ("user/repo", "a1b2c3d"),
+        ("user/repo", "main"),
+    ]
+    # only the files below "hf://datasets/user/repo/" share their metadata: every other root is resolved separately
+    assert fake_resolve_path == [
+        "datasets/user/repo/data/train.txt",
+        "datasets/user/repo2/data/train.txt",
+        "datasets/user/repo@main/data/train.txt",
+        "datasets/user/repo@a1b2c3d/data/train.txt",
+    ]
+
+
+def test_get_origin_metadata_from_endpoint_urls(fake_resolve_path):
+    data_files = [f"https://huggingface.co/datasets/user/repo/resolve/main/data/shard-{i}.txt" for i in range(3)] + [
+        "https://huggingface.co/datasets/user/repo/resolve/main/README.md"
+    ]
+    # the URLs of a dataset repository don't contain "hf://", so they go through the multithreaded code path
+    origin_metadata = _get_origin_metadata(data_files, download_config=DownloadConfig())
+    assert origin_metadata == [("user/repo", "main")] * 4
+    assert len(fake_resolve_path) == 4
+
+
+def test_get_origin_metadata_of_local_files(tmp_path):
+    (tmp_path / "train.txt").write_text("train")
+    (tmp_path / "test.txt").write_text("test")
+    data_files = [(tmp_path / name).as_posix() for name in ["train.txt", "test.txt"]]
+    origin_metadata = _get_origin_metadata(data_files)
+    assert len(origin_metadata) == 2
+    assert all(len(metadata) == 1 and isinstance(metadata[0], str) for metadata in origin_metadata)

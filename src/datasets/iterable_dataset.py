@@ -2023,7 +2023,51 @@ class InterleavedShardsExamplesIterable(_BaseExamplesIterable):
 
 
 class BufferShuffledExamplesIterable(_BaseExamplesIterable):
-    def __init__(self, ex_iterable: _BaseExamplesIterable, buffer_size: int, generator: np.random.Generator):
+    """Shuffle the examples of `ex_iterable` using a shuffle buffer of `buffer_size` examples.
+
+    The examples are added one by one in the buffer. Once the buffer is full, it is shuffled, half of the examples are
+    yielded and the other half stays in the buffer to be mixed with the next examples. This provides an approximate
+    shuffling of the whole stream of examples, with a memory usage bounded by `buffer_size`.
+
+    The content of the shuffle buffer is not saved in the `state_dict`, since it would require to keep up to
+    `buffer_size` examples in memory. Instead, the `state_dict` saves the position of each example that is in the
+    buffer or that is about to be yielded, along with a few past states of the underlying iterable. When resuming from
+    a checkpoint, the underlying iterable is read again from the most recent of those states that predates the oldest
+    example to read again, and only the examples whose position was saved are put back in the buffer, in the same
+    order. The iteration then goes on with the random generator state of the checkpoint: it resumes exactly where it
+    was interrupted, without yielding any example a second time and without skipping any example.
+
+    Reading the examples of the buffer again also requires to read the examples that are in between: an example stays
+    in the buffer for `buffer_size` examples on average, and the oldest example of the buffer was read
+    `3.5 * buffer_size` examples before the checkpoint for a buffer of 128 examples (`5.6 * buffer_size` for a buffer
+    of 10000 examples, since this number grows with the logarithm of the buffer size). In practice, about
+    `5 * buffer_size` examples are read again on average when resuming, and at most `8 * buffer_size`.
+
+    The `state_dict` grows by a few bytes per example that is in the buffer: it is about 10KB for a buffer of 1000
+    examples, and 75KB for a buffer of 10000 examples.
+
+    State dicts saved by older versions of the library don't contain the positions of the examples in the buffer: in
+    that case the buffer is simply refilled with the examples that come next, and the examples that were in the buffer
+    when the checkpoint was saved are lost.
+    """
+
+    max_previous_states = 8
+    """Number of past states of the underlying iterable that are kept in the `state_dict`, to read the buffered
+    examples again when resuming. Together with `previous_state_step`, this covers `previous_state_step *
+    max_previous_states` times `buffer_size` examples behind the current position, which is more than the number of
+    examples an example stays in the buffer (a few times `buffer_size`, growing with the logarithm of the buffer
+    size)."""
+
+    previous_state_step = 2
+    """Number of `buffer_size` between two consecutive past states of the underlying iterable saved in the
+    `state_dict`. The smaller it is, the fewer examples have to be read again to restore the shuffle buffer."""
+
+    def __init__(
+        self,
+        ex_iterable: _BaseExamplesIterable,
+        buffer_size: int,
+        generator: np.random.Generator,
+    ):
         super().__init__()
         self.ex_iterable = ex_iterable
         self.buffer_size = buffer_size
@@ -2051,93 +2095,461 @@ class BufferShuffledExamplesIterable(_BaseExamplesIterable):
         return self._iter_arrow if self.ex_iterable.iter_arrow else None
 
     def _init_state_dict(self) -> dict:
-        self._state_dict = self.ex_iterable._init_state_dict()
+        self._state_dict = {
+            "examples_iterable": self.ex_iterable._init_state_dict(),
+            "bit_generator_state": self.generator.bit_generator.state,
+            "num_examples_read": 0,
+            "num_examples_yielded": 0,
+            # positions in the underlying iterable of the examples that are in the shuffle buffer, in buffer order
+            # (while the examples out of the buffer are being yielded, they are listed here as well until they are
+            # actually yielded)
+            "buffer_positions": [],
+            # positions of the examples that were out of the shuffle buffer when the state was saved, in the reverse
+            # of the order in which they have to be yielded, so that the next one to yield is the last of the list.
+            # It's empty except when a state is saved in the middle of a shuffle of the buffer, which happens with the
+            # python format only.
+            "next_positions": [],
+            # past states of the underlying iterable, used to read the examples in the buffer again when resuming
+            "previous_states": [],
+            "type": self.__class__.__name__,
+        }
         self._original_state_dict = self.state_dict()
         return self._state_dict
 
     def load_state_dict(self, state_dict: dict) -> dict:
-        if self._state_dict:
-            if state_dict != self._original_state_dict:
-                logger.warning(
-                    "Loading a state dict of a shuffle buffer of a dataset without the buffer content."
-                    "The shuffle buffer will be refilled before starting to yield new examples."
-                )
-        return super().load_state_dict(state_dict)
+        previous_states = state_dict.get("previous_states")
+        buffer_positions = state_dict.get("buffer_positions")
+        next_positions = state_dict.get("next_positions")
+        if "examples_iterable" not in state_dict:
+            # Backward compatibility: before the shuffle buffer could be restored when resuming, the state dict of this
+            # iterable was the state dict of the underlying iterable, which contains no buffer position nor previous
+            # state
+            state_dict = {"examples_iterable": deepcopy(state_dict)}
+        # `previous_states`, `buffer_positions` and `next_positions` are lists of variable size that have to replace
+        # the current ones rather than being merged with them, so they are loaded here instead of being loaded by
+        # `_inner_load_state_dict`
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key not in ("previous_states", "buffer_positions", "next_positions")
+        }
+        resume_from_checkpoint = (
+            bool(self._state_dict)
+            and state_dict["examples_iterable"] != self._original_state_dict["examples_iterable"]
+        )
+        state_dict = super().load_state_dict(state_dict)
+        state_dict["previous_states"] = self._load_previous_states(previous_states)
+        state_dict["buffer_positions"] = _fast_copy(buffer_positions) if buffer_positions is not None else []
+        state_dict["next_positions"] = _fast_copy(next_positions) if next_positions is not None else []
+        if resume_from_checkpoint and buffer_positions is None:
+            logger.warning(
+                "Loading a state dict of a shuffle buffer of a dataset that does not contain the positions of the "
+                "examples in the buffer. The examples that were in the buffer when the state was saved are lost: the "
+                "buffer is refilled with the examples that come next."
+            )
+        return state_dict
 
-    @staticmethod
-    def _iter_random_indices(rng: np.random.Generator, buffer_size: int, random_batch_size=1000) -> Iterator[int]:
-        while True:
-            yield from (int(i) for i in rng.integers(0, buffer_size, size=random_batch_size))
+    def _load_previous_states(self, previous_states: Optional[list]) -> list:
+        """Get the saved past states of the underlying iterable.
+
+        State dicts saved by older versions of the library don't contain any past state: in that case no example can be
+        read again to restore the shuffle buffer, so the checkpointed position is the only saved state.
+        """
+        if not previous_states:
+            return [
+                _fast_copy(
+                    {
+                        "examples_iterable": self._state_dict["examples_iterable"],
+                        "num_examples_read": self._state_dict["num_examples_read"],
+                    }
+                )
+            ]
+        return [_fast_copy(previous_state) for previous_state in previous_states[: self.max_previous_states]]
+
+    def _save_previous_state(self) -> None:
+        """Save the state of the underlying iterable, to read examples again from a past state when resuming.
+
+        The states are saved every `previous_state_step * buffer_size` examples, and only the last
+        `max_previous_states` ones are kept: the examples of the shuffle buffer were read within the last few times
+        `buffer_size` examples, so only the recent states are useful. The state at the beginning of the epoch is
+        always available in `_original_state_dict`, as a fallback when the oldest example of the buffer was read
+        before any of the saved states.
+        """
+        previous_states = self._state_dict["previous_states"]
+        step = max(1, self.previous_state_step * self.buffer_size)
+        if previous_states and self._state_dict["num_examples_read"] - previous_states[-1]["num_examples_read"] < step:
+            return
+        previous_states.append(
+            {
+                "examples_iterable": self.ex_iterable.state_dict(),
+                "num_examples_read": self._state_dict["num_examples_read"],
+            }
+        )
+        while len(previous_states) > self.max_previous_states:
+            del previous_states[0]
+
+    def _origin_state(self, oldest_position: int) -> tuple[dict, int]:
+        """Get the state of the underlying iterable to start reading from to get the buffered examples back.
+
+        The most recent of the saved states that predates `oldest_position` is used, so that the number of examples
+        that have to be read again stays as small as possible. If the oldest example of the buffer was read before all
+        the saved states, the state at the beginning of the epoch is used instead.
+
+        Args:
+            oldest_position (`int`): the position of the oldest example in the shuffle buffer.
+
+        Returns:
+            `tuple[dict, int]`: the state of the underlying iterable to read again, and the number of examples that
+            had been read from it when that state was saved.
+        """
+        for previous_state in reversed(self._state_dict["previous_states"]):
+            if previous_state["num_examples_read"] <= oldest_position:
+                return _fast_copy(previous_state["examples_iterable"]), previous_state["num_examples_read"]
+        # the oldest example in the buffer was read before any of the saved states: read again from the beginning
+        # of the epoch, and drop the examples that had already been yielded
+        return _fast_copy(self._original_state_dict["examples_iterable"]), 0
+
+    def _resume_buffer(self) -> tuple[Optional[set], Optional[dict], Optional[list], int, int]:
+        """Rewind the underlying iterable, so that the examples in the shuffle buffer can be read again.
+
+        Returns:
+            `tuple[Optional[set], Optional[dict], Optional[list], int, int]`: the set of positions to read again (or
+            None when nothing has to be read again), the examples that have been read again (initially empty), the
+            positions to read again in the order in which they have to be yielded, the number of positions in that
+            list that are yielded before the shuffle buffer is used again, and the number of examples that had been
+            read from the underlying iterable when reading starts again.
+        """
+        # the examples that were already out of the buffer are yielded first, in the order they were to be yielded.
+        # When the state was saved in the middle of a shuffle of the buffer, `buffer_positions` contains again the
+        # positions of `next_positions`: they are kept only once here, in the order in which they have to be yielded.
+        queued_positions = set(self._state_dict["next_positions"])
+        positions_to_restore = self._state_dict["next_positions"][::-1] + [
+            position for position in self._state_dict["buffer_positions"] if position not in queued_positions
+        ]
+        if not positions_to_restore:
+            return None, None, None, 0, self._state_dict["num_examples_read"]
+        origin_state, num_examples_read = self._origin_state(min(positions_to_restore))
+        self.ex_iterable.load_state_dict(origin_state)
+        # `load_state_dict` creates a new state dict in the underlying iterable: we have to point at the new one
+        self._state_dict["examples_iterable"] = self.ex_iterable._state_dict
+        return (
+            set(positions_to_restore),
+            {},
+            positions_to_restore,
+            len(self._state_dict["next_positions"]),
+            num_examples_read,
+        )
 
     def __iter__(self):
-        buffer_size = self.buffer_size
         rng = deepcopy(self.generator)
-        # this is the shuffle buffer that we keep in memory
-        mem_buffer = []
-        current_len = 0
-        for x in self.ex_iterable:
-            mem_buffer.append(x)
-            current_len += 1
+        num_examples_read = 0
+        num_examples_yielded = 0
+        num_examples_to_restore = 0
+        pending_positions = None
+        if self._state_dict:
+            rng.bit_generator.state = self._state_dict["bit_generator_state"]
+            num_examples_yielded = self._state_dict["num_examples_yielded"]
+            # all the examples that had been read when the state was saved have to be read again: the examples of the
+            # shuffle buffer are in between them
+            num_examples_to_restore = self._state_dict["num_examples_read"]
+            pending_positions, examples_read_again, positions_to_restore, num_queued_positions, num_examples_read = (
+                self._resume_buffer()
+            )
+        # this is the shuffle buffer that we keep in memory, along with the position of each example in the epoch.
+        # Both lists are the ones of the state dict too, so that a state dict saved at any moment knows exactly what
+        # examples have to be read again to get the shuffle buffer back.
+        mem_buffer: list = []
+        buffer_positions: list = []
+        # the positions of the examples that are out of the shuffle buffer and are to be yielded, in reverse yield
+        # order. It's only used when a state dict is loaded in the middle of a shuffle of the buffer.
+        next_positions: list = []
+        if self._state_dict:
+            buffer_positions = self._state_dict["buffer_positions"]
+            next_positions = self._state_dict["next_positions"]
+        for position, (key, example) in enumerate(self.ex_iterable, num_examples_read):
+            num_examples_read += 1
+            if self._state_dict:
+                self._state_dict["num_examples_read"] = num_examples_read
+
+            if pending_positions is not None:
+                # the examples that had been read when the state was saved are read again, to get back the ones that
+                # were in the shuffle buffer: the other ones had already been yielded, so they are dropped
+                if position in pending_positions:
+                    examples_read_again[position] = (key, example)
+                    pending_positions.discard(position)
+                was_read_before_checkpoint = position < num_examples_to_restore
+                if position >= num_examples_to_restore or num_examples_read >= num_examples_to_restore:
+                    # the reading caught up with the position of the checkpoint: the shuffle buffer is restored with
+                    # the examples that were in it, and the examples that come next are added to it as usual
+                    mem_buffer = []
+                    buffer_positions = []
+                    for buffer_position in positions_to_restore[num_queued_positions:]:
+                        if buffer_position in examples_read_again:
+                            mem_buffer.append(examples_read_again[buffer_position])
+                            buffer_positions.append(buffer_position)
+                    # the examples that were already out of the shuffle buffer when the state was saved are yielded
+                    # first, in the order in which they were to be yielded. They stay in `next_positions`, in reverse
+                    # order, until they are actually yielded.
+                    # `next_positions` is in reverse yield order: popping it yields the examples in the right order
+                    yield_buffer = [examples_read_again[position] for position in next_positions]
+                    pending_positions = None
+                    if self._state_dict:
+                        self._state_dict["buffer_positions"] = buffer_positions
+                    while yield_buffer:
+                        key, example = yield_buffer.pop()
+                        next_positions.pop()
+                        num_examples_yielded += 1
+                        if self._state_dict:
+                            self._state_dict["num_examples_yielded"] = num_examples_yielded
+                        yield key, example
+                    if was_read_before_checkpoint:
+                        continue
+                else:
+                    continue
+
+            mem_buffer.append((key, example))
+            if self._state_dict:
+                buffer_positions.append(position)
 
             # Amortize shuffle cost by waiting until buffer is full.
             # Once the buffer reaches `buffer_size`, we shuffle it, yield half, and keep half.
             # This maintains a rolling randomized buffer while strictly bounding memory usage.
-            if current_len >= buffer_size:
-                indices = rng.permutation(current_len)
-                keep_rows = buffer_size // 2
-                rows_to_yield = current_len - keep_rows
-                for i in indices[:rows_to_yield]:
+            if len(mem_buffer) >= self.buffer_size:
+                indices = rng.permutation(len(mem_buffer))
+                keep_rows = self.buffer_size // 2
+                rows_to_yield = len(indices) - keep_rows
+                if self._state_dict:
+                    # The examples to yield are moved at the end of the buffer, in reverse yield order, and are popped
+                    # out of it one by one as they are yielded. Like this, a state dict saved in the middle of that
+                    # keeps the position of the examples that are still to yield: none is lost, none is yielded twice.
+                    mem_buffer = [mem_buffer[i] for i in indices[rows_to_yield:]] + [
+                        mem_buffer[i] for i in indices[:rows_to_yield]
+                    ][::-1]
+                    buffer_positions = [buffer_positions[i] for i in indices[rows_to_yield:]] + [
+                        buffer_positions[i] for i in indices[:rows_to_yield]
+                    ][::-1]
+                    next_positions = buffer_positions[keep_rows:]
+                    self._state_dict["bit_generator_state"] = rng.bit_generator.state
+                    self._state_dict["buffer_positions"] = buffer_positions
+                    self._state_dict["next_positions"] = next_positions
+                    self._state_dict["num_examples_yielded"] = num_examples_yielded
+                    self._save_previous_state()
+                    while len(mem_buffer) > keep_rows:
+                        key, example = mem_buffer.pop()
+                        buffer_positions.pop()
+                        next_positions.pop()
+                        num_examples_yielded += 1
+                        self._state_dict["num_examples_yielded"] = num_examples_yielded
+                        yield key, example
+                else:
+                    for i in indices[:rows_to_yield]:
+                        yield mem_buffer[i]
+                    mem_buffer = [mem_buffer[i] for i in indices[rows_to_yield:]]
+
+        if pending_positions:
+            # the underlying iterable is exhausted before all the examples to read again were read: only the ones that
+            # were read again can be yielded
+            mem_buffer = []
+            buffer_positions = []
+            for buffer_position in positions_to_restore[num_queued_positions:]:
+                if buffer_position in examples_read_again:
+                    mem_buffer.append(examples_read_again[buffer_position])
+                    buffer_positions.append(buffer_position)
+            # `next_positions` is in reverse yield order: popping it yields the examples in the right order
+            yield_buffer = [examples_read_again[position] for position in next_positions]
+            if self._state_dict:
+                self._state_dict["buffer_positions"] = buffer_positions
+            while yield_buffer:
+                key, example = yield_buffer.pop()
+                next_positions.pop()
+                num_examples_yielded += 1
+                if self._state_dict:
+                    self._state_dict["num_examples_yielded"] = num_examples_yielded
+                yield key, example
+
+        if mem_buffer:
+            # the underlying iterable is exhausted: the buffer is shuffled and drained one last time
+            indices = rng.permutation(len(mem_buffer))
+            if self._state_dict:
+                # as above, the examples are yielded one by one, from the end of the buffer, so that a state dict
+                # saved in the middle of that keeps the position of the examples that are still to yield
+                mem_buffer = [mem_buffer[i] for i in indices][::-1]
+                next_positions = [buffer_positions[i] for i in indices][::-1]
+                self._state_dict["bit_generator_state"] = rng.bit_generator.state
+                self._state_dict["buffer_positions"] = []
+                self._state_dict["next_positions"] = next_positions
+                self._state_dict["num_examples_yielded"] = num_examples_yielded
+                while mem_buffer:
+                    key, example = mem_buffer.pop()
+                    next_positions.pop()
+                    num_examples_yielded += 1
+                    self._state_dict["num_examples_yielded"] = num_examples_yielded
+                    yield key, example
+            else:
+                for i in indices:
                     yield mem_buffer[i]
 
-                mem_buffer = [mem_buffer[i] for i in indices[rows_to_yield:]]
-                current_len = keep_rows
-
-        if current_len > 0:
-            indices = rng.permutation(current_len)
-            for i in indices:
-                yield mem_buffer[i]
-
     def _iter_arrow(self):
-        from copy import deepcopy
-
         import pyarrow as pa
         import pyarrow.compute as pc
 
         rng = deepcopy(self.generator)
+        num_examples_read = 0
+        num_examples_yielded = 0
+        num_examples_to_restore = 0
+        pending_positions = None
+        positions_to_restore = None
+        num_queued_positions = 0
+        if self._state_dict:
+            rng.bit_generator.state = self._state_dict["bit_generator_state"]
+            num_examples_yielded = self._state_dict["num_examples_yielded"]
+            # all the rows that had been read when the state was saved have to be read again: the rows of the shuffle
+            # buffer are in between them
+            num_examples_to_restore = self._state_dict["num_examples_read"]
+            pending_positions, tables_read_again, positions_to_restore, num_queued_positions, num_examples_read = (
+                self._resume_buffer()
+            )
+
+        # this is the shuffle buffer that we keep in memory: chunks of rows, and the position of each row in the epoch
         tables = []
+        positions = []
         current_len = 0
         last_key = None
 
         for key, pa_table in self.ex_iterable.iter_arrow():
+            if len(pa_table) == 0:
+                # an empty table has no schema sometimes, and it would break `pa.concat_tables` in the shuffle buffer
+                continue
             last_key = key
+
+            if pending_positions is not None:
+                # the rows that had been read when the state was saved are read again, to get the ones that were in the
+                # shuffle buffer back: the other ones had already been yielded, so they are dropped
+                num_rows_before_checkpoint = min(len(pa_table), max(0, num_examples_to_restore - num_examples_read))
+                for offset in range(num_rows_before_checkpoint):
+                    position = num_examples_read + offset
+                    if position in pending_positions:
+                        tables_read_again[position] = pa_table.slice(offset, 1)
+                        pending_positions.discard(position)
+                num_examples_read += num_rows_before_checkpoint
+                if self._state_dict:
+                    self._state_dict["num_examples_read"] = num_examples_read
+                if num_examples_read < num_examples_to_restore:
+                    continue
+                # the reading caught up with the position of the checkpoint: the shuffle buffer is restored, and the
+                # rows that come next are added to it as usual
+                pa_table = pa_table.slice(num_rows_before_checkpoint)
+                queued_positions = [
+                    position
+                    for position in positions_to_restore[:num_queued_positions]
+                    if position in tables_read_again
+                ]
+                restored_positions = [
+                    position
+                    for position in positions_to_restore[num_queued_positions:]
+                    if position in tables_read_again
+                ]
+                if queued_positions:
+                    # the rows that were out of the buffer when the state was saved are yielded again first. They are
+                    # yielded all together, since a batch of rows is always yielded at once with the arrow format
+                    num_examples_yielded += len(queued_positions)
+                    if self._state_dict:
+                        self._state_dict["next_positions"] = []
+                        self._state_dict["num_examples_yielded"] = num_examples_yielded
+                    yield last_key, pa.concat_tables([tables_read_again[position] for position in queued_positions])
+                if restored_positions:
+                    tables = [pa.concat_tables([tables_read_again[position] for position in restored_positions])]
+                    positions = [np.asarray(restored_positions)]
+                    current_len = len(restored_positions)
+                else:
+                    tables = []
+                    positions = []
+                    current_len = 0
+                if self._state_dict:
+                    self._state_dict["buffer_positions"] = list(restored_positions)
+                pending_positions = None
+                tables_read_again = {}
+                if len(pa_table) == 0:
+                    continue
+
+            table_positions = np.arange(num_examples_read, num_examples_read + len(pa_table))
+            num_examples_read += len(pa_table)
+            if self._state_dict:
+                self._state_dict["num_examples_read"] = num_examples_read
+
             tables.append(pa_table)
+            positions.append(table_positions)
             current_len += len(pa_table)
+            if self._state_dict:
+                # as in __iter__, the state dict knows at any moment which rows are in the shuffle buffer: they are the
+                # ones that have to be read again when resuming
+                self._state_dict["buffer_positions"].extend(int(position) for position in table_positions)
 
             # Amortize shuffle cost by waiting until buffer is full.
             # Once the buffer reaches `buffer_size`, we shuffle it, yield half, and keep half.
             # This maintains a rolling randomized buffer while strictly bounding memory usage.
             if current_len >= self.buffer_size:
                 buffer_table = pa.concat_tables(tables)
+                buffer_positions = np.concatenate(positions)
                 indices = rng.permutation(current_len)
                 shuffled_table = pc.take(buffer_table, indices)
-
-                # Keep half of the buffer to mix with incoming data on the next iteration
                 keep_rows = self.buffer_size // 2
                 rows_to_yield = current_len - keep_rows
+                # the rows to yield are taken out of the buffer before they are yielded, since a batch of rows is
+                # always yielded at once with the arrow format
+                tables = [shuffled_table.slice(rows_to_yield)]
+                positions = [buffer_positions[indices[rows_to_yield:]]]
+                current_len = keep_rows
+                if self._state_dict:
+                    self._state_dict["bit_generator_state"] = rng.bit_generator.state
+                    self._state_dict["buffer_positions"] = [int(position) for position in positions[0]]
+                    self._state_dict["next_positions"] = []
+                    self._state_dict["num_examples_yielded"] = num_examples_yielded + rows_to_yield
+                    self._save_previous_state()
+                num_examples_yielded += rows_to_yield
+                # the counters are updated before the rows are yielded, so that a state dict saved while those rows
+                # are being processed considers them as already yielded
                 yield key, shuffled_table.slice(0, rows_to_yield)
 
-                tables = [shuffled_table.slice(rows_to_yield)]
-                current_len = keep_rows
-
+        if pending_positions:
+            # the underlying iterable is exhausted before all the rows of the buffer were read again: only the ones
+            # that were read again can be yielded
+            queued_positions = [
+                position for position in positions_to_restore[:num_queued_positions] if position in tables_read_again
+            ]
+            restored_positions = [
+                position for position in positions_to_restore[num_queued_positions:] if position in tables_read_again
+            ]
+            if queued_positions:
+                num_examples_yielded += len(queued_positions)
+                if self._state_dict:
+                    self._state_dict["next_positions"] = []
+                    self._state_dict["num_examples_yielded"] = num_examples_yielded
+                yield last_key, pa.concat_tables([tables_read_again[position] for position in queued_positions])
+            if restored_positions:
+                tables = [pa.concat_tables([tables_read_again[position] for position in restored_positions])]
+                positions = [np.asarray(restored_positions)]
+                current_len = len(restored_positions)
+            else:
+                current_len = 0
         if current_len > 0:
+            # the underlying iterable is exhausted: the buffer is shuffled and drained one last time
             buffer_table = pa.concat_tables(tables)
             indices = rng.permutation(current_len)
-            yield last_key, pc.take(buffer_table, indices)
+            shuffled_table = pc.take(buffer_table, indices)
+            num_examples_yielded += current_len
+            if self._state_dict:
+                self._state_dict["num_examples_yielded"] = num_examples_yielded
+                self._state_dict["buffer_positions"] = []
+                self._state_dict["next_positions"] = []
+            yield last_key, shuffled_table
 
     def shuffle_data_sources(self, generator: np.random.Generator) -> "BufferShuffledExamplesIterable":
         """Shuffle the wrapped examples iterable as well as the shuffling buffer."""
         return BufferShuffledExamplesIterable(
-            self.ex_iterable.shuffle_data_sources(generator), buffer_size=self.buffer_size, generator=self.generator
+            self.ex_iterable.shuffle_data_sources(generator),
+            buffer_size=self.buffer_size,
+            generator=self.generator,
         )
 
     def shard_data_sources(self, num_shards: int, index: int, contiguous=True) -> "BufferShuffledExamplesIterable":
@@ -2769,7 +3181,8 @@ class IterableDataset(DatasetInfoMixin):
 
         Resuming returns exactly where the checkpoint was saved except in two cases:
 
-        1. examples from shuffle buffers are lost when resuming and the buffers are refilled with new data
+        1. the examples that were in the shuffle buffers when the checkpoint was saved are lost: the buffers are
+           refilled by reading the previous examples again, and the lost examples are replaced by new ones
         2. combinations of `.with_format(arrow)` and batched `.map()` may skip one batch.
 
         Returns:
@@ -2822,7 +3235,8 @@ class IterableDataset(DatasetInfoMixin):
 
         Resuming returns exactly where the checkpoint was saved except in two cases:
 
-        1. examples from shuffle buffers are lost when resuming and the buffers are refilled with new data
+        1. the examples that were in the shuffle buffers when the checkpoint was saved are lost: the buffers are
+           refilled by reading the previous examples again, and the lost examples are replaced by new ones
         2. combinations of `.with_format(arrow)` and batched `.map()` may skip one batch.
 
         Example:

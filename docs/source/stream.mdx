@@ -574,7 +574,7 @@ This can be used with the `StatefulDataLoader` from `torchdata`:
 ```
 
 > [!TIP]
-> Resuming returns exactly where the checkpoint was saved except if `.shuffle()` is used: examples from shuffle buffers are lost when resuming and the buffers are refilled with new data.
+> Resuming returns exactly where the checkpoint was saved, even if `.shuffle()` is used. The content of the shuffle buffers is not saved in the `state_dict`, but the position of each example that is still in the buffer is: when resuming, the underlying dataset is read again from a past state to fill the buffer back with the same examples, so no example is yielded a second time and no example is skipped. It means that resuming after `.shuffle(buffer_size=...)` reads about `5 * buffer_size` examples again on average (at most `8 * buffer_size`), and that the `state_dict` grows by a few bytes per example in the buffer (about 10KB for a shuffle buffer of 1000 examples).
 
 
 ## Save
